@@ -554,7 +554,6 @@ fn report_state_if_changed(
     }
 }
 
-// 🟢 FIX TRIỆT ĐỂ: Gộp chung xử lý PWM, Bật, Tắt, và Force_On
 fn process_mqtt_commands(
     cmd_rx: &Receiver<MqttCommandPayload>,
     config: &DeviceConfig,
@@ -566,7 +565,6 @@ fn process_mqtt_commands(
 
     while let Ok(cmd) = cmd_rx.try_recv() {
         if cmd.action == "SYNC_STATUS" {
-            info!("🔄 YÊU CẦU ĐỒNG BỘ TỪ APP...");
             force_sync = true;
             continue;
         }
@@ -580,7 +578,7 @@ fn process_mqtt_commands(
         }
 
         if config.control_mode == ControlMode::Auto {
-            warn!("Bỏ qua lệnh thủ công ({}) vì đang ở AUTO.", cmd.pump);
+            warn!("Bỏ qua lệnh thủ công vì đang ở AUTO.");
             continue;
         }
 
@@ -590,7 +588,6 @@ fn process_mqtt_commands(
         let is_force_on = action_lower == "force_on";
         let is_set_pwm = action_lower == "set_pwm";
 
-        // Xem bơm có được phép BẬT không?
         let is_on = is_force_on
             || action_lower == "pump_on"
             || action_lower == "on"
@@ -598,20 +595,14 @@ fn process_mqtt_commands(
             || action_lower == "1"
             || (is_set_pwm && cmd.pwm.unwrap_or(0) > 0);
 
+        // 🟢 NẾU LÀ LỆNH CƯỠNG CHẾ TỪ APP -> KÍCH HOẠT CỜ VÔ HIỆU HÓA AN TOÀN
         if is_force_on {
-            info!("⚠️ LỆNH CƯỠNG CHẾ ĐÃ KÍCH HOẠT CHO {}", pump_name);
-            let duration = cmd.duration_sec.unwrap_or(120); // Mặc định 2 phút
+            info!("⚠️ NGƯỜI DÙNG CƯỠNG CHẾ BẬT {}!", pump_name);
+            let duration = cmd.duration_sec.unwrap_or(120); // App đang gửi 120s
             ctx.safety_override_until = current_time_ms + (duration as u64 * 1000);
         }
 
-        info!(
-            "🕹️ MANUAL MODE: Lệnh {} = {} (PWM: {:?})",
-            pump_name,
-            if is_on { "BẬT" } else { "TẮT" },
-            cmd.pwm
-        );
-
-        // Hẹn giờ tắt an toàn
+        // Cài đặt hẹn giờ tắt bơm bình thường
         if is_on {
             if let Some(duration) = cmd.duration_sec {
                 if duration > 0 {
@@ -623,7 +614,6 @@ fn process_mqtt_commands(
             ctx.manual_timeouts.remove(&pump_name);
         }
 
-        // Lấy giá trị PWM (nếu lệnh không truyền pwm thì mặc định là 100% nếu ON)
         let pwm_val = if let Some(p) = cmd.pwm {
             p
         } else {
@@ -1090,4 +1080,3 @@ fn run_auto_fsm(
         SystemState::EmergencyStop => {}
     }
 }
-
