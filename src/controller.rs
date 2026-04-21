@@ -5,6 +5,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Import thư viện cho Cron
+use chrono::{Local, TimeZone};
+use cron::Schedule;
+use std::str::FromStr;
+
 use crate::config::{ControlMode, DeviceConfig, SharedConfig};
 use crate::mqtt::{MqttCommandPayload, PumpStatus, SensorData};
 use crate::pump::{PumpController, PumpType, WaterDirection};
@@ -112,6 +117,13 @@ pub struct ControlContext {
     pub current_state: SystemState,
     pub last_water_change_time: u64,
     pub last_scheduled_dose_time_sec: u64,
+
+    // 🟢 Trạng thái lưu trữ Lịch CRON
+    pub next_cron_trigger_sec: Option<u64>,
+    pub current_cron_expr: String,
+    pub next_water_change_trigger_sec: Option<u64>,
+    pub current_water_change_cron_expr: String,
+
     pub ec_retry_count: u8,
     pub ph_retry_count: u8,
     pub water_refill_retry_count: u8,
@@ -140,6 +152,12 @@ impl Default for ControlContext {
             current_state: SystemState::Monitoring,
             last_water_change_time: 0,
             last_scheduled_dose_time_sec: 0,
+
+            next_cron_trigger_sec: None,
+            current_cron_expr: String::new(),
+            next_water_change_trigger_sec: None,
+            current_water_change_cron_expr: String::new(),
+
             ec_retry_count: 0,
             ph_retry_count: 0,
             water_refill_retry_count: 0,
@@ -431,7 +449,7 @@ pub fn start_fsm_control_loop(
                             ctx.current_state = SystemState::Monitoring;
                         }
                     } else if config.control_mode == ControlMode::Auto && !is_safety_overridden {
-                        // ==== LOGIC AUTO (Chỉ chạy khi không bị cưỡng chế) ====
+                        // ==== LOGIC AUTO ====
                         let is_hot = config.enable_temp_sensor
                             && (sensors.temp_value >= config.misting_temp_threshold);
                         let on_duration = if is_hot {
@@ -531,6 +549,7 @@ pub fn start_fsm_control_loop(
                 }
             }
 
+            // 🟢 LỆNH COMMAND XUỐNG SENSOR NODE: Bật đo nước liên tục nếu đang bơm/xả
             let needs_continuous = matches!(
                 ctx.current_state,
                 SystemState::WaterRefilling { .. } | SystemState::WaterDraining { .. }
@@ -743,26 +762,60 @@ fn run_auto_fsm(
         SystemState::Monitoring => {
             ctx.verify_sensor_ack(sensors, config);
 
+            // 🟢 THAY NƯỚC ĐỊNH KỲ THEO LỊCH CRON
             if config.enable_water_level_sensor
                 && config.scheduled_water_change_enabled
-                && current_time_sec.saturating_sub(ctx.last_water_change_time)
-                    > config.water_change_interval_sec
+                && !config.water_change_cron.is_empty()
             {
-                let target = (sensors.water_level - config.scheduled_drain_amount_cm)
-                    .max(config.water_level_min);
-                ctx.last_water_change_time = current_time_sec;
-                if let Some(flash) = nvs.as_mut() {
-                    let _ = flash.set_u64("last_w_change", current_time_sec);
+                if ctx.current_water_change_cron_expr != config.water_change_cron {
+                    ctx.current_water_change_cron_expr = config.water_change_cron.clone();
+                    if let Ok(schedule) = Schedule::from_str(&ctx.current_water_change_cron_expr) {
+                        if let Some(next) = schedule.upcoming(Local).next() {
+                            ctx.next_water_change_trigger_sec = Some(next.timestamp() as u64);
+                            info!("⏰ Cập nhật lịch Thay nước Cron: {}", next);
+                        }
+                    } else {
+                        warn!("⚠️ Lỗi cú pháp Cron Thay nước!");
+                        ctx.next_water_change_trigger_sec = None;
+                    }
                 }
-                ctx.current_state = SystemState::WaterDraining {
-                    target_level: target,
-                    start_time: current_time_ms,
-                };
-                let _ = pump_ctrl.set_water_pump(WaterDirection::Out);
-                ctx.pump_status.water_pump_out = true;
-                ctx.pump_status.water_pump_in = false;
-                ctx.fsm_osaka_active = false;
-            } else if config.enable_water_level_sensor
+
+                if let Some(next_trigger) = ctx.next_water_change_trigger_sec {
+                    if current_time_sec >= next_trigger {
+                        info!("⏰ Đã đến giờ THAY NƯỚC ĐỊNH KỲ theo lịch CRON!");
+
+                        if let Ok(schedule) =
+                            Schedule::from_str(&ctx.current_water_change_cron_expr)
+                        {
+                            let future = Local::now() + chrono::Duration::seconds(1);
+                            if let Some(next) = schedule.after(&future).next() {
+                                ctx.next_water_change_trigger_sec = Some(next.timestamp() as u64);
+                            }
+                        }
+
+                        let target = (sensors.water_level - config.scheduled_drain_amount_cm)
+                            .max(config.water_level_min);
+                        ctx.last_water_change_time = current_time_sec;
+
+                        if let Some(flash) = nvs.as_mut() {
+                            let _ = flash.set_u64("last_w_change", current_time_sec);
+                        }
+
+                        ctx.current_state = SystemState::WaterDraining {
+                            target_level: target,
+                            start_time: current_time_ms,
+                        };
+                        let _ = pump_ctrl.set_water_pump(WaterDirection::Out);
+                        ctx.pump_status.water_pump_out = true;
+                        ctx.pump_status.water_pump_in = false;
+                        ctx.fsm_osaka_active = false;
+
+                        return; // Ưu tiên thay nước, kết thúc nhịp xử lý hiện tại
+                    }
+                }
+            }
+
+            if config.enable_water_level_sensor
                 && config.auto_refill_enabled
                 && sensors.water_level < (config.water_level_target - config.water_level_tolerance)
             {
@@ -810,33 +863,56 @@ fn run_auto_fsm(
             } else {
                 let mut is_dosing_active = false;
 
-                // 🟢 1. LOGIC MỚI: BƠM ĐỊNH KỲ THEO THỜI GIAN (Ưu tiên kiểm tra trước EC)
-                if config.scheduled_dosing_enabled
-                    && current_time_sec.saturating_sub(ctx.last_scheduled_dose_time_sec)
-                        > config.scheduled_dosing_interval_sec
-                {
-                    ctx.last_scheduled_dose_time_sec = current_time_sec;
-                    if let Some(flash) = nvs.as_mut() {
-                        let _ = flash.set_u64("last_sched_dose", current_time_sec);
+                // 🟢 BƠM ĐỊNH KỲ THEO LỊCH CRON
+                if config.scheduled_dosing_enabled && !config.scheduled_dosing_cron.is_empty() {
+                    if ctx.current_cron_expr != config.scheduled_dosing_cron {
+                        ctx.current_cron_expr = config.scheduled_dosing_cron.clone();
+                        if let Ok(schedule) = Schedule::from_str(&ctx.current_cron_expr) {
+                            if let Some(next) = schedule.upcoming(Local).next() {
+                                ctx.next_cron_trigger_sec = Some(next.timestamp() as u64);
+                                info!("⏰ Cập nhật lịch Dosing Cron: {}", next);
+                            }
+                        } else {
+                            warn!("⚠️ Biểu thức Cron Dosing không hợp lệ!");
+                            ctx.next_cron_trigger_sec = None;
+                        }
                     }
 
-                    let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
+                    if let Some(next_trigger) = ctx.next_cron_trigger_sec {
+                        if current_time_sec >= next_trigger {
+                            info!("⏰ Đã đến giờ BƠM DINH DƯỠNG theo lịch CRON!");
 
-                    if config.scheduled_dose_a_ml > 0.0 || config.scheduled_dose_b_ml > 0.0 {
-                        ctx.current_state = SystemState::StartingOsakaPump {
-                            finish_time: current_time_ms + config.soft_start_duration,
-                            pending_action: PendingDose::ScheduledDose {
-                                dose_a_ml: config.scheduled_dose_a_ml,
-                                dose_b_ml: config.scheduled_dose_b_ml,
-                                pwm_percent: safe_pwm,
-                            },
-                        };
-                        ctx.fsm_osaka_active = true;
-                        is_dosing_active = true;
+                            if let Ok(schedule) = Schedule::from_str(&ctx.current_cron_expr) {
+                                let future = Local::now() + chrono::Duration::seconds(1);
+                                if let Some(next) = schedule.after(&future).next() {
+                                    ctx.next_cron_trigger_sec = Some(next.timestamp() as u64);
+                                }
+                            }
+
+                            ctx.last_scheduled_dose_time_sec = current_time_sec;
+                            if let Some(flash) = nvs.as_mut() {
+                                let _ = flash.set_u64("last_sched_dose", current_time_sec);
+                            }
+
+                            let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
+                            if config.scheduled_dose_a_ml > 0.0 || config.scheduled_dose_b_ml > 0.0
+                            {
+                                ctx.current_state = SystemState::StartingOsakaPump {
+                                    finish_time: current_time_ms + config.soft_start_duration,
+                                    pending_action: PendingDose::ScheduledDose {
+                                        dose_a_ml: config.scheduled_dose_a_ml,
+                                        dose_b_ml: config.scheduled_dose_b_ml,
+                                        pwm_percent: safe_pwm,
+                                    },
+                                };
+                                ctx.fsm_osaka_active = true;
+                                is_dosing_active = true;
+                            }
+                        }
                     }
                 }
 
-                // 🟢 2. LOGIC CŨ: BÙ EC TỰ ĐỘNG
+                // 🟢 BÙ EC TỰ ĐỘNG
                 if config.enable_ec_sensor
                     && !is_dosing_active
                     && sensors.ec_value < (config.ec_target - config.ec_tolerance)
@@ -869,6 +945,8 @@ fn run_auto_fsm(
                     }
                 }
 
+                // 🟢 BÙ PH TỰ ĐỘNG
+                // 🟢 BÙ PH TỰ ĐỘNG
                 if config.enable_ph_sensor
                     && !is_dosing_active
                     && (sensors.ph_value - config.ph_target).abs() > config.ph_tolerance
@@ -887,8 +965,16 @@ fn run_auto_fsm(
                             config.ph_shift_down_per_ml
                         };
                         let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
-                        let active_capacity =
-                            config.dosing_pump_capacity_ml_per_sec * (safe_pwm as f32 / 100.0);
+
+                        // 🟢 MỚI: Lấy chính xác capacity của bơm pH Up hoặc pH Down
+                        let base_capacity = if is_ph_up {
+                            config.pump_ph_up_capacity_ml_per_sec
+                        } else {
+                            config.pump_ph_down_capacity_ml_per_sec
+                        };
+
+                        let active_capacity = base_capacity * (safe_pwm as f32 / 100.0);
+
                         let dose_ml = (diff / ratio * config.ph_step_ratio)
                             .clamp(0.0, config.max_dose_per_cycle);
                         let duration_ms = ((dose_ml / active_capacity) * 1000.0) as u64;
@@ -1106,7 +1192,6 @@ fn run_auto_fsm(
                         dose_a_ml_reported,
                     };
                 } else {
-                    // Nếu liều lượng B = 0 -> Bỏ qua bơm B -> Report luôn
                     let report_json = format!(
                         r#"{{"start_ec":{:.2},"start_ph":{:.2},"pump_a_ml":{:.2},"pump_b_ml":0.0,"ph_up_ml":0.0,"ph_down_ml":0.0,"target_ec":{:.2},"target_ph":{:.2}}}"#,
                         start_ec, start_ph, dose_a_ml_reported, target_ec, config.ph_target

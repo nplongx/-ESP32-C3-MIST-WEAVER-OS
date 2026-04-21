@@ -31,7 +31,7 @@ pub struct DeviceConfig {
     pub auto_dilute_enabled: bool,
     pub dilute_drain_amount_cm: f32,
     pub scheduled_water_change_enabled: bool,
-    pub water_change_interval_sec: u64,
+    pub water_change_cron: String, // 🟢 THAY ĐỔI: Sử dụng Cron (VD: "0 0 7 * * SUN")
     pub scheduled_drain_amount_cm: f32,
     pub misting_on_duration_ms: u64,
     pub misting_off_duration_ms: u64,
@@ -61,10 +61,11 @@ pub struct DeviceConfig {
     pub ec_step_ratio: f32,
     pub ph_step_ratio: f32,
 
-    pub dosing_pump_capacity_ml_per_sec: f32,
     pub pump_a_capacity_ml_per_sec: f32, // VD: 1.2 ml/s
     pub pump_b_capacity_ml_per_sec: f32, // VD: 1.15 ml/s
     pub delay_between_a_and_b_sec: u64,  // Độ trễ (Mix) giữa A và B, VD: 10 giây
+    pub pump_ph_up_capacity_ml_per_sec: f32,
+    pub pump_ph_down_capacity_ml_per_sec: f32,
 
     pub soft_start_duration: u64,
     pub scheduled_mixing_interval_sec: u64,
@@ -77,6 +78,7 @@ pub struct DeviceConfig {
     pub ec_offset: f32,
     pub temp_offset: f32,
     pub temp_compensation_beta: f32,
+    pub tank_height: f32, // 🟢 MỚI THÊM: Độ cao thực tế của bể (cm) để đo mực nước
     pub sampling_interval: u64,
     pub publish_interval: u64,
     pub moving_average_window: u32,
@@ -95,10 +97,10 @@ pub struct DeviceConfig {
     pub high_temp_misting_on_duration_ms: u64,
     pub high_temp_misting_off_duration_ms: u64,
 
-    pub scheduled_dosing_enabled: bool,     // Cờ bật/tắt
-    pub scheduled_dosing_interval_sec: u64, // Chu kỳ bơm (giây)
-    pub scheduled_dose_a_ml: f32,           // Liều lượng bơm A (ml)
-    pub scheduled_dose_b_ml: f32,           // Liều lượng bơm B (ml)
+    pub scheduled_dosing_enabled: bool,
+    pub scheduled_dosing_cron: String, // 🟢 THAY ĐỔI: Sử dụng Cron (VD: "0 0 8 * * *")
+    pub scheduled_dose_a_ml: f32,      // Liều lượng bơm A (ml)
+    pub scheduled_dose_b_ml: f32,      // Liều lượng bơm B (ml)
 }
 
 impl Default for DeviceConfig {
@@ -122,7 +124,7 @@ impl Default for DeviceConfig {
             auto_dilute_enabled: true,
             dilute_drain_amount_cm: 2.0,
             scheduled_water_change_enabled: false,
-            water_change_interval_sec: 259200,
+            water_change_cron: "0 0 7 * * SUN".to_string(), // Mặc định 7h sáng Chủ Nhật
             scheduled_drain_amount_cm: 5.0,
             misting_on_duration_ms: 10000,
             misting_off_duration_ms: 180000,
@@ -150,11 +152,11 @@ impl Default for DeviceConfig {
             ec_step_ratio: 0.4,
             ph_step_ratio: 0.2,
 
-            dosing_pump_capacity_ml_per_sec: 1.0,
-
             pump_a_capacity_ml_per_sec: 1.2,  // VD: 1.2 ml/s
             pump_b_capacity_ml_per_sec: 1.15, // VD: 1.15 ml/s
             delay_between_a_and_b_sec: 10,    // Độ trễ (Mix) giữa A và B, VD: 10 giây
+            pump_ph_up_capacity_ml_per_sec: 1.2,
+            pump_ph_down_capacity_ml_per_sec: 1.2,
 
             soft_start_duration: 3000,
             scheduled_mixing_interval_sec: 3600,
@@ -166,6 +168,7 @@ impl Default for DeviceConfig {
             ec_offset: 0.0,
             temp_offset: 0.0,
             temp_compensation_beta: 0.02,
+            tank_height: 100.0, // Mặc định bể cao 100 cm
             sampling_interval: 1000,
             publish_interval: 5000,
             moving_average_window: 10,
@@ -186,7 +189,7 @@ impl Default for DeviceConfig {
             high_temp_misting_off_duration_ms: 60000,
 
             scheduled_dosing_enabled: false,
-            scheduled_dosing_interval_sec: 86400, // 1 Ngày
+            scheduled_dosing_cron: "0 0 8 * * *".to_string(), // Mặc định 8h sáng hàng ngày
             scheduled_dose_a_ml: 10.0,
             scheduled_dose_b_ml: 10.0,
         }
@@ -198,3 +201,4 @@ pub type SharedConfig = Arc<RwLock<DeviceConfig>>;
 pub fn create_shared_config() -> SharedConfig {
     Arc::new(RwLock::new(DeviceConfig::default()))
 }
+
