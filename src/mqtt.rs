@@ -46,6 +46,9 @@ pub struct IncomingSensorPayload {
     pub uptime: Option<u32>,
     pub is_continuous: Option<bool>,
     pub err_water: Option<bool>,
+    pub err_temp: Option<bool>,
+    pub err_ph: Option<bool>,
+    pub err_ec: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +60,15 @@ pub struct SensorData {
     pub last_update_ms: u64,
     #[serde(default)]
     pub pump_status: PumpStatus,
+
+    #[serde(default)]
+    pub err_water: bool,
+    #[serde(default)]
+    pub err_temp: bool,
+    #[serde(default)]
+    pub err_ph: bool,
+    #[serde(default)]
+    pub err_ec: bool,
 }
 
 impl Default for SensorData {
@@ -68,6 +80,10 @@ impl Default for SensorData {
             water_level: 20.0,
             last_update_ms: 0,
             pump_status: PumpStatus::default(),
+            err_water: false,
+            err_temp: false,
+            err_ph: false,
+            err_ec: false,
         }
     }
 }
@@ -229,6 +245,23 @@ pub fn init_mqtt_client(
                                     sensors.water_level = w;
                                 }
 
+                                if let Some(w) = payload.water_level {
+                                    sensors.water_level = w;
+                                }
+                                // 🟢 ÁNH XẠ CỜ LỖI VÀO RAM CHO FSM
+                                if let Some(err) = payload.err_water {
+                                    sensors.err_water = err;
+                                }
+                                if let Some(err) = payload.err_temp {
+                                    sensors.err_temp = err;
+                                }
+                                if let Some(err) = payload.err_ec {
+                                    sensors.err_ec = err;
+                                }
+                                if let Some(err) = payload.err_ph {
+                                    sensors.err_ph = err;
+                                }
+
                                 sensors.last_update_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -258,4 +291,3 @@ pub fn init_mqtt_client(
 
     Ok(client)
 }
-

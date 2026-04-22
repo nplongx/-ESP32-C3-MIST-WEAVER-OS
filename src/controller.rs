@@ -40,7 +40,7 @@ pub enum PendingDose {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SystemState {
     Monitoring,
-    EmergencyStop(String), // 🟢 Cập nhật: Thêm String mang lý do lỗi
+    EmergencyStop(String),
     SystemFault(String),
     WaterRefilling {
         target_level: f32,
@@ -98,7 +98,6 @@ impl SystemState {
     pub fn to_payload_string(&self) -> String {
         match self {
             SystemState::Monitoring => "Monitoring".to_string(),
-            // 🟢 Cập nhật: Gửi kèm lý do Emergency
             SystemState::EmergencyStop(reason) => format!("EmergencyStop:{}", reason),
             SystemState::SystemFault(reason) => format!("SystemFault:{}", reason),
             SystemState::WaterRefilling { .. } => "WaterRefilling".to_string(),
@@ -119,7 +118,6 @@ pub struct ControlContext {
     pub last_water_change_time: u64,
     pub last_scheduled_dose_time_sec: u64,
 
-    // 🟢 Trạng thái lưu trữ Lịch CRON
     pub next_cron_trigger_sec: Option<u64>,
     pub current_cron_expr: String,
     pub next_water_change_trigger_sec: Option<u64>,
@@ -246,7 +244,7 @@ impl ControlContext {
 
     fn check_and_update_noise(&mut self, sensors: &SensorData, config: &DeviceConfig) -> bool {
         let mut is_noisy = false;
-        if config.enable_ec_sensor {
+        if config.enable_ec_sensor && !sensors.err_ec {
             if let Some(prev_ec) = self.previous_ec_value {
                 if (sensors.ec_value - prev_ec).abs() > config.max_ec_delta {
                     warn!("⚠️ Nhiễu EC. Bỏ qua nhịp này!");
@@ -255,7 +253,7 @@ impl ControlContext {
             }
             self.previous_ec_value = Some(sensors.ec_value);
         }
-        if config.enable_ph_sensor {
+        if config.enable_ph_sensor && !sensors.err_ph {
             if let Some(prev_ph) = self.previous_ph_value {
                 if (sensors.ph_value - prev_ph).abs() > config.max_ph_delta {
                     warn!("⚠️ Nhiễu pH. Bỏ qua nhịp này!");
@@ -268,7 +266,7 @@ impl ControlContext {
     }
 
     fn verify_sensor_ack(&mut self, sensors: &SensorData, config: &DeviceConfig) {
-        if config.enable_ec_sensor {
+        if config.enable_ec_sensor && !sensors.err_ec {
             if let Some(last_ec) = self.last_ec_before_dosing {
                 if (sensors.ec_value - last_ec) >= config.ec_ack_threshold {
                     self.ec_retry_count = 0;
@@ -279,7 +277,7 @@ impl ControlContext {
                 self.last_ec_before_dosing = None;
             }
         }
-        if config.enable_ph_sensor {
+        if config.enable_ph_sensor && !sensors.err_ph {
             if let Some(last_ph) = self.last_ph_before_dosing {
                 let is_up = self.last_ph_dosing_is_up.unwrap_or(true);
                 let is_ack_ok = if is_up {
@@ -297,7 +295,7 @@ impl ControlContext {
                 self.last_ph_dosing_is_up = None;
             }
         }
-        if config.enable_water_level_sensor {
+        if config.enable_water_level_sensor && !sensors.err_water {
             if let Some(w) = self.last_water_before_refill {
                 if (sensors.water_level - w) >= config.water_ack_threshold {
                     self.water_refill_retry_count = 0;
@@ -395,26 +393,15 @@ pub fn start_fsm_control_loop(
                 ctx.turn_off_pump(&pump, &mut pump_ctrl);
             }
 
-            let is_sensor_disconnected = sensors.last_update_ms != 0
-                && current_time_ms > sensors.last_update_ms
-                && (current_time_ms - sensors.last_update_ms) > 30_000;
-
+            // 🟢 Thay vì Timeout (Vì giờ có 2 node, timeout có thể do Node Controller tự đếm), FSM kiểm tra qua Error Flags.
             let is_safety_overridden = current_time_ms < ctx.safety_override_until;
 
-            if is_sensor_disconnected && !is_safety_overridden {
-                if !matches!(ctx.current_state, SystemState::EmergencyStop(_))
-                    && !matches!(ctx.current_state, SystemState::SystemFault(_))
-                {
-                    error!("📡⏳ MẤT KẾT NỐI BOARD CẢM BIẾN! Dừng hệ thống.");
-                    ctx.stop_all_pumps(&mut pump_ctrl);
-                    ctx.current_state = SystemState::SystemFault("SENSOR_DISCONNECTED".to_string());
-                }
-                report_state_if_changed(&ctx.current_state, &mut last_reported_state, &fsm_mqtt_tx);
-            } else {
+            if !is_safety_overridden {
+                // Kiểm tra nhiễu (Bỏ qua nhịp nếu nhiễu)
                 if ctx.check_and_update_noise(&sensors, &config)
                     && config.control_mode == ControlMode::Auto
                 {
-                    // Bỏ qua nhịp này do nhiễu
+                    // Skip
                 } else {
                     let is_water_critical = config.enable_water_level_sensor
                         && (sensors.water_level < config.water_level_critical_min);
@@ -425,10 +412,18 @@ pub fn start_fsm_control_loop(
                         && (sensors.ph_value < config.min_ph_limit
                             || sensors.ph_value > config.max_ph_limit);
 
-                    // 🟢 MỚI: Bóc tách lý do Emergency cụ thể
+                    // 🟢 MỚI: Bóc tách lý do Emergency cụ thể, BAO GỒM CỜ LỖI CẢM BIẾN (Từ Sensor Node gửi sang)
                     let mut emergency_reason = String::new();
                     if config.emergency_shutdown {
                         emergency_reason = "MANUAL_STOP".to_string();
+                    } else if config.enable_water_level_sensor && sensors.err_water {
+                        emergency_reason = "SENSOR_FAULT_WATER".to_string();
+                    } else if config.enable_ec_sensor && sensors.err_ec {
+                        emergency_reason = "SENSOR_FAULT_EC".to_string();
+                    } else if config.enable_ph_sensor && sensors.err_ph {
+                        emergency_reason = "SENSOR_FAULT_PH".to_string();
+                    } else if config.enable_temp_sensor && sensors.err_temp {
+                        emergency_reason = "SENSOR_FAULT_TEMP".to_string();
                     } else if is_water_critical {
                         emergency_reason = "WATER_CRITICAL".to_string();
                     } else if is_ec_out_of_bounds {
@@ -440,7 +435,7 @@ pub fn start_fsm_control_loop(
                     let should_emergency_stop = !emergency_reason.is_empty();
 
                     // 🟢 NẾU NGUY HIỂM VÀ KHÔNG BỊ CƯỠNG CHẾ -> NGẮT
-                    if should_emergency_stop && !is_safety_overridden {
+                    if should_emergency_stop {
                         if !matches!(ctx.current_state, SystemState::EmergencyStop(_)) {
                             error!(
                                 "⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống! Lý do: {}",
@@ -455,12 +450,12 @@ pub fn start_fsm_control_loop(
                             ctx.current_state = SystemState::Monitoring;
                         }
                     } else if matches!(ctx.current_state, SystemState::EmergencyStop(_)) {
-                        // 🟢 NẾU MÔI TRƯỜNG ĐÃ AN TOÀN LẠI (HOẶC BỊ CƯỠNG CHẾ) -> HỦY DỪNG KHẨN CẤP
-                        if !should_emergency_stop || is_safety_overridden {
+                        // 🟢 NẾU MÔI TRƯỜNG ĐÃ AN TOÀN LẠI -> HỦY DỪNG KHẨN CẤP
+                        if !should_emergency_stop {
                             info!("✅ Hệ thống an toàn trở lại (hoặc đang Cưỡng chế).");
                             ctx.current_state = SystemState::Monitoring;
                         }
-                    } else if config.control_mode == ControlMode::Auto && !is_safety_overridden {
+                    } else if config.control_mode == ControlMode::Auto {
                         // ==== LOGIC AUTO ====
                         let is_hot = config.enable_temp_sensor
                             && (sensors.temp_value >= config.misting_temp_threshold);
@@ -618,7 +613,6 @@ fn process_mqtt_commands(
 ) -> bool {
     let mut force_sync = false;
 
-    // 🟢 MỚI: BỨC TƯỜNG LỬA CHẶN LỆNH NORMAL KHI EMERGENCY/FAULT
     let is_emergency_state = matches!(
         ctx.current_state,
         SystemState::EmergencyStop(_) | SystemState::SystemFault(_)
@@ -656,7 +650,6 @@ fn process_mqtt_commands(
             || action_lower == "1"
             || (is_set_pwm && cmd.pwm.unwrap_or(0) > 0);
 
-        // 🟢 BỨC TƯỜNG LỬA BẢO VỆ FSM: Chặn lệnh bật / set PWM thông thường
         if is_emergency_state && is_on && !is_force_on {
             warn!("❌ BLOCKED: Không thể điều khiển {} bình thường vì hệ thống đang Lỗi / EmergencyStop. Vui lòng dùng FORCE.", pump_name);
             continue;
@@ -836,7 +829,7 @@ fn run_auto_fsm(
                         ctx.pump_status.water_pump_in = false;
                         ctx.fsm_osaka_active = false;
 
-                        return; // Ưu tiên thay nước, kết thúc nhịp xử lý hiện tại
+                        return;
                     }
                 }
             }
